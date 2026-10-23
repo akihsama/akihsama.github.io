@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>今日食签 · 每日吃什么</title>
+<link rel="stylesheet" href="css/platform.css">
 <style>
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -759,7 +760,10 @@
     transform-origin: top center;
     transition: transform 0.6s cubic-bezier(0.34, 1.56, 0.64, 1);
     padding: 20px 16px;
-    overflow: hidden;
+    /* v0.5：签卡要能容纳"去下单"按钮，超出高度时内部滚动，不裁切 */
+    max-height: 78vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
     z-index: 20;
   }
 
@@ -1025,18 +1029,35 @@
   </div>
 
   <div class="content-scroll-area">
+    <!-- ===== v0.5 附近可下单：美团 / 闪购 ===== -->
+    <section class="platform-pane" id="platformPane" aria-label="附近可下单">
+      <div class="pane-head">
+        <span class="pane-title">🥢 附近可下单</span>
+        <span class="pane-sub">美团 · 闪购 实时比价</span>
+        <button class="icon-btn" id="paneLocate" type="button" title="使用精确定位" aria-label="使用精确定位">◎</button>
+        <button class="icon-btn" id="paneRefresh" type="button" title="刷新" aria-label="刷新">↻</button>
+      </div>
+      <div class="pane-status" id="paneStatus"></div>
+      <div class="pane-tabs">
+        <button type="button" data-pane-tab="products" class="active">团购 / 商品</button>
+        <button type="button" data-pane-tab="shops">门店</button>
+      </div>
+      <div class="pane-list" id="paneList"></div>
+      <p class="pane-foot">价格与库存以平台实时页面为准；下单与支付在美团 App / 淘宝闪购完成，本站不代收款项。</p>
+    </section>
+
     <div class="llm-section">
       <div class="section-title-row">
-        <div class="section-title">✨ 问问 DeepSeek 食神</div>
-        <span class="agent-badge" id="agentBadge">DeepSeek</span>
+        <div class="section-title">✨ 问问食神</div>
+        <span class="agent-badge" id="agentBadge">deepseek-flash</span>
       </div>
-      <div class="agent-hint" id="agentHint">优先由 DeepSeek 推荐，接口尚未配置时自动使用本地食神。</div>
+      <div class="agent-hint" id="agentHint">食神会先联网查附近的真实门店与团购，再给你出签。后端未配置时自动降级为本地食神。</div>
       <div class="llm-input-area">
         <input type="text" class="llm-input" id="llmInput" maxlength="300" autocomplete="off" placeholder="想吃什么？说说口味、预算或场景..." onkeydown="handleKeyDown(event)">
         <button type="button" class="llm-send-btn" id="llmSendBtn" onclick="sendLLM()">发送</button>
       </div>
       <div class="llm-thinking" id="llmThinking" role="status" aria-live="polite">
-        <span id="llmThinkingText">DeepSeek 正在思考</span>
+        <span id="llmThinkingText">食神正在翻签</span>
         <span class="thinking-dots" aria-hidden="true"><span></span><span></span><span></span></span>
       </div>
       <div class="llm-result" id="llmResult" role="status" aria-live="polite"></div>
@@ -1107,6 +1128,8 @@
         <div class="card-bottom">
           <div class="card-blessing" id="cardBlessing">食运亨通，万事如意</div>
         </div>
+        <!-- v0.5：签上直接给"能下单的东西"，没有平台数据时自动隐藏 -->
+        <div class="card-platform" id="cardPlatform" hidden></div>
       </div>
     </div>
   </div>
@@ -1114,9 +1137,15 @@
   <div class="close-hint" id="closeHint">点击空白处关闭</div>
 </div>
 
+<!-- v0.5 模块：规范层 / 定位 / 平台适配器 / 面板 / 离线示例 -->
+<script src="js/normalizer.js"></script>
+<script src="js/location.js"></script>
+<script src="js/client.js"></script>
+<script src="js/mock.js"></script>
+<script src="js/pane.js"></script>
+
 <script>
-  const foodDatabase = [
-    { name: '寿司拼盘', emoji: '🍣', desc: '新鲜的鱼肉搭配醋饭，口感丰富，今日宜品尝日式料理', fortune: '大吉', blessing: '食运亨通，万事皆宜' },
+  const foodDatabase = [    { name: '寿司拼盘', emoji: '🍣', desc: '新鲜的鱼肉搭配醋饭，口感丰富，今日宜品尝日式料理', fortune: '大吉', blessing: '食运亨通，万事皆宜' },
     { name: '红烧牛肉面', emoji: '🍜', desc: '浓郁汤底配软烂牛肉，一碗暖胃又暖心', fortune: '大吉', blessing: '鸿运当头，好事连连' },
     { name: '日式咖喱饭', emoji: '🍛', desc: '香浓咖喱搭配酥脆炸物，满足感爆棚', fortune: '中吉', blessing: '平稳顺遂，心安理得' },
     { name: '麻辣火锅', emoji: '🍲', desc: '热辣翻滚，食材丰富，与好友共享最佳', fortune: '大吉', blessing: '红红火火，热闹非凡' },
@@ -1167,23 +1196,28 @@
     { name: '火腿炖甲鱼', emoji: '🐢', desc: '徽菜 火腿配甲鱼文火炖，滋补徽帮大菜', fortune: '吉', blessing: '甲鱼聚气，稳稳当当' }
   ];
 
-  // ================= 后端 / Agent 配置 =================
-  // 部署「问食神」后端后（见 backend/README.md），把 agent 接口地址填到下面这行。
-  // 例如：const AGENT_ENDPOINT = 'https://shiqian-agent.你的子域.workers.dev';
-  // 留空（''）时，app 自动降级为本地食神（不联网、不用 key）。
-  const AGENT_ENDPOINT = 'https://shiqian-agent.3314445455.workers.dev';
+  // ================= 后端 / Agent 配置（v0.5） =================
+  // 后端上线后（见 backend/README.md），把 Worker 地址填到下面这行，末尾不带斜杠。
+  // 例如：const API_BASE = 'https://shiqian-api.你的子域.workers.dev';
+  // 留空（''）时走同源 /api/*；两者都不可达时自动降级为本地食神 + 本地签库。
+  const API_BASE = 'https://shiqian-agent.3314445455.workers.dev';
 
-  // DeepSeek agent 接入点：POST /api/chat
-  // 请求：{ provider, model, messages, context }
-  // 响应：{ reply, foodName?, provider?, model? }
+  // mock = true 时完全不发网络请求，用 app/js/mock.js 的示例数据预览 UI。
+  const USE_MOCK = false;
+
+  // AI 接口：POST /v1/chat
+  // 请求：{ messages, context: { city, lat, lng, foods[], currentFood, prefs[] } }
+  // 响应：{ reply, foodName?, recommend?, sources?[], model, provider, usage }
   const AGENT_CONFIG = Object.freeze({
-    endpoint: AGENT_ENDPOINT || '/api/chat',
-    provider: 'deepseek',
-    model: 'deepseek-chat',
-    timeoutMs: 30000,
+    model: 'deepseek-flash',
+    timeoutMs: 40000,
     fallbackToLocal: true,
     maxHistoryMessages: 8
   });
+
+  if (window.ShiqianApi) {
+    window.ShiqianApi.configure({ baseUrl: API_BASE ? API_BASE + '/api' : '/api', mock: USE_MOCK });
+  }
 
   let conversation = [];
   let isSending = false;
@@ -1263,6 +1297,8 @@
     stickCard.classList.remove('unfold');
     glowEffect.classList.remove('active');
     closeHint.classList.remove('show');
+    const cpReset = document.getElementById('cardPlatform');
+    if (cpReset) { cpReset.hidden = true; cpReset.innerHTML = ''; }
 
     overlay.classList.add('active');
 
@@ -1347,7 +1383,61 @@
       stickCard.classList.add('unfold');
       flyingStick.classList.add('opened');
       addHistory(window.currentFood);
+      // v0.5：翻开签的同时，去平台找这道菜的真实商品
+      loadCardPlatform(window.currentFood);
     }, 300);
+  }
+
+  // ===== v0.5：把签和真实商品接上 =====
+  // 签是"想吃什么"，平台面板是"哪里能买到"，这一步负责把两件事连起来。
+  function loadCardPlatform(food) {
+    const box = document.getElementById('cardPlatform');
+    if (!box || !food) return;
+    box.hidden = false;
+    box.innerHTML = '<div class="card-platform-main">正在美团 / 闪购找「' + food.name + '」…</div>';
+
+    const timer = setTimeout(() => {
+      box.innerHTML = '<div class="card-platform-main">平台响应有点慢，先按签上说的吃吧。</div>';
+    }, 12000);
+
+    if (!window.ShiqianPane || !window.ShiqianApi || window.ShiqianApi.config.mock) {
+      clearTimeout(timer);
+      box.hidden = true;
+      return;
+    }
+
+    window.ShiqianPane.searchByFood(food.name).then(res => {
+      clearTimeout(timer);
+      const hit = (res && res.products && res.products[0]) || null;
+      const anyConfigured = res && res.sources &&
+        (res.sources.meituan === 'ok' || res.sources.shangou === 'ok');
+
+      if (!hit) {
+        box.innerHTML = '<div class="card-platform-main">' +
+          (anyConfigured ? '附近暂时没搜到这道菜，换个签再看看。' : '平台还没接上，签依然是签。') +
+          '</div>';
+        return;
+      }
+
+      const price = window.ShiqianNormalizer.money(hit.price);
+      const shopName = hit.shopName || '附近门店';
+
+      if (hit.url) {
+        const a = document.createElement('a');
+        a.className = 'card-platform-link';
+        a.href = hit.url;
+        a.target = '_blank';
+        a.rel = 'noopener nofollow';
+        a.textContent = `去${window.ShiqianNormalizer.SOURCE_META[hit.source].label}下单 ${price}`;
+        box.innerHTML = '<div class="card-platform-main">' + shopName + ' · ' + price + '</div>';
+        box.appendChild(a);
+      } else {
+        box.innerHTML = '<div class="card-platform-main">' + shopName + ' · ' + price + '（下方「附近可下单」可看详情）</div>';
+      }
+    }).catch(() => {
+      clearTimeout(timer);
+      box.innerHTML = '<div class="card-platform-main">平台暂时没响应，稍后再试。</div>';
+    });
   }
 
   function addHistory(food) {
@@ -1391,6 +1481,8 @@
       document.getElementById('flyingStick').classList.remove('fly-out', 'opened');
       document.getElementById('stickSealed').classList.remove('hidden');
       document.getElementById('stickCard').classList.remove('unfold');
+      const cp = document.getElementById('cardPlatform');
+      if (cp) { cp.hidden = true; cp.innerHTML = ''; }
       document.getElementById('glowEffect').classList.remove('active');
       document.getElementById('closeHint').classList.remove('show');
       isStickOpened = false;
@@ -1443,74 +1535,59 @@
       .trim();
   }
 
+  // v0.5：后端返回的是结构化推荐（recommend），前端把签库切成
+  // 「平台有货」和「纯签库」两池，优先在真实商品里出签。
   function resolveFood(payload, reply) {
-    const explicitName = payload?.foodName || payload?.food?.name;
-    const bracketName = reply.match(/【([^】]{1,24})】/)?.[1];
+    const explicitName = payload?.foodName || payload?.recommend?.foodName || payload?.food?.name;
+    const bracketName = reply && reply.match(/【([^】]{1,24})】/)?.[1];
     const candidate = typeof explicitName === 'string' ? explicitName.trim() : bracketName;
 
     if (candidate) {
-      const exact = foodDatabase.find(food => food.name === candidate);
+      const exact = foodDatabase.find(food => food.name === candidate || candidate.includes(food.name));
       if (exact) return exact;
+      // 平台真实推荐不在本地签库里，合成一支临时签，保证卡片能显示
+      return {
+        name: candidate,
+        emoji: payload?.recommend?.emoji || '🍽️',
+        desc: payload?.recommend?.reason || '食神从附近真实商品里挑的，点下面的按钮直接去平台看。',
+        fortune: payload?.recommend?.fortune || '吉',
+        blessing: payload?.recommend?.blessing || '顺心顺口，刚刚好',
+        ephemeral: true
+      };
     }
 
-    return foodDatabase.find(food => reply.includes(food.name));
+    return foodDatabase.find(food => reply && reply.includes(food.name));
   }
 
-  async function requestDeepSeek() {
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), AGENT_CONFIG.timeoutMs);
+  async function requestFoodgod() {
+    const ctx = window.ShiqianPrefs ? window.ShiqianPrefs.current() : null;
+    const pane = window.ShiqianPane && window.ShiqianPane.state;
 
-    try {
-      const currentFood = window.currentFood
-        ? { name: window.currentFood.name, desc: window.currentFood.desc }
-        : null;
+    const currentFood = window.currentFood
+      ? { name: window.currentFood.name, desc: window.currentFood.desc }
+      : null;
 
-      const response = await fetch(AGENT_CONFIG.endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({
-          provider: AGENT_CONFIG.provider,
-          model: AGENT_CONFIG.model,
-          messages: conversation.slice(-AGENT_CONFIG.maxHistoryMessages),
-          context: {
-            foods: foodDatabase.map(food => ({
-              name: food.name,
-              emoji: food.emoji,
-              desc: food.desc,
-              blessing: food.blessing
-            })),
-            currentFood
-          }
-        }),
-        signal: controller.signal
-      });
-
-      const raw = await response.text();
-      let payload = {};
-      try {
-        payload = raw ? JSON.parse(raw) : {};
-      } catch {
-        throw new Error('后端返回了无法解析的响应');
+    return window.ShiqianApi.chat({
+      messages: conversation.slice(-AGENT_CONFIG.maxHistoryMessages),
+      timeoutMs: AGENT_CONFIG.timeoutMs,
+      context: {
+        city: ctx ? ctx.city.name : '',
+        lat: ctx ? ctx.lat : undefined,
+        lng: ctx ? ctx.lng : undefined,
+        currentFood,
+        // 附近已有平台数据时只传前 20 条，避免 prompt 过长（省钱）
+        nearby: pane ? (pane.products || []).slice(0, 20).map(p => ({
+          name: p.title,
+          price: p.price,
+          shop: p.shopName,
+          source: p.source
+        })) : [],
+        foods: foodDatabase.map(food => ({ name: food.name, desc: food.desc }))
       }
-
-      if (!response.ok) {
-        throw new Error(payload.error || `DeepSeek 接口请求失败（${response.status}）`);
-      }
-
-      if (!extractAgentReply(payload)) {
-        throw new Error('DeepSeek 未返回有效内容');
-      }
-
-      return payload;
-    } finally {
-      window.clearTimeout(timeoutId);
-    }
+    });
   }
 
-  function renderAgentReply(reply, sourceLabel, sourceType, detail = '') {
+  function renderAgentReply(reply, sourceLabel, sourceType, detail = '', sources = []) {
     const result = document.getElementById('llmResult');
     const source = document.createElement('div');
     const content = document.createElement('div');
@@ -1520,6 +1597,23 @@
     content.textContent = normalizeReply(reply);
 
     result.replaceChildren(source, content);
+
+    // 联网搜索结果作为小字来源列表，让用户知道这句话有出处
+    if (Array.isArray(sources) && sources.length) {
+      const box = document.createElement('div');
+      box.className = 'agent-sources';
+      box.appendChild(document.createTextNode('参考：'));
+      sources.slice(0, 3).forEach((s, i) => {
+        const a = document.createElement('a');
+        a.href = s.url || '#';
+        a.target = '_blank';
+        a.rel = 'noopener nofollow';
+        a.textContent = `${i + 1}. ${s.title || s.site || '来源'}`;
+        box.appendChild(a);
+      });
+      result.appendChild(box);
+    }
+
     result.dataset.source = sourceType;
     result.classList.add('show');
   }
@@ -1536,23 +1630,30 @@
     conversation.push({ role: 'user', content: text });
 
     try {
-      const payload = await requestDeepSeek();
+      const payload = await requestFoodgod();
       const reply = normalizeReply(extractAgentReply(payload));
       const food = resolveFood(payload, reply);
 
       renderAgentReply(
         reply,
-        'DeepSeek',
+        '美团 · 闪购 · 联网搜索',
         'deepseek',
-        payload.model || AGENT_CONFIG.model
+        payload.model || AGENT_CONFIG.model,
+        payload.sources || []
       );
-      document.getElementById('agentBadge').textContent = 'DeepSeek';
-      document.getElementById('agentHint').textContent = '当前回复由 DeepSeek 生成。';
+      document.getElementById('agentBadge').textContent = payload.model || AGENT_CONFIG.model;
+      document.getElementById('agentHint').textContent = payload.searchUsed
+        ? '本条回复已联网核对附近真实门店与团购。'
+        : '本条回复未触发联网（后端搜索额度或配置受限）。';
       conversation.push({ role: 'assistant', content: reply });
 
-      if (food) addHistory(food);
+      if (food) {
+        addHistory(food);
+        // 把 AI 选的那道菜作为关键词，刷新下方平台面板
+        if (window.ShiqianPane) window.ShiqianPane.searchByFood(food.name);
+      }
     } catch (error) {
-      console.warn('DeepSeek 调用失败：', error);
+      console.warn('食神后端调用失败：', error);
 
       if (!AGENT_CONFIG.fallbackToLocal) {
         renderAgentReply('暂时无法连接食神，请稍后重试。', '连接失败', 'local');
@@ -1562,7 +1663,7 @@
 
         renderAgentReply(reply, '本地食神', 'local', '降级模式');
         document.getElementById('agentBadge').textContent = '本地降级';
-        document.getElementById('agentHint').textContent = 'DeepSeek 接口暂不可用，当前使用本地推荐。配置后端后会自动切换。';
+        document.getElementById('agentHint').textContent = '后端暂不可用，当前使用本地推荐。配置好后会自动切换。';
         conversation.push({ role: 'assistant', content: reply });
 
         if (food) addHistory(food);
@@ -1618,6 +1719,11 @@
     return `${openings[Math.floor(Math.random() * openings.length)]}\n\n${food.desc}\n\n「${food.blessing}」`;
   }
   createPetals();
+
+  // ===== v0.5 启动：初始化平台面板 =====
+  if (window.ShiqianPane) {
+    window.ShiqianPane.init();
+  }
   </script>
   <!-- sound fx + ambient rain/wind -->
   <style>

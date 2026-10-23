@@ -1,0 +1,138 @@
+/**
+ * 单元测试（node --test，无需安装依赖、无需网络）
+ * ---------------------------------------------------------------
+ * 覆盖三类最容易悄悄坏掉的地方：
+ *   1. 闪购签名（跟官方 SDK 的算法要逐字节一致）
+ *   2. AI 出签的解析与兜底（模型不听话时前端不能白屏）
+ *   3. 平台归一化（美团/闪购两种字段结构 → 同一套）
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+
+import { sign } from '../src/providers/shangou.js';
+import { parseRecommendation, fallbackRecommendation, buildSystemPrompt } from '../src/prompt.js';
+import { meituanConfigured } from '../src/providers/meituan.js';
+
+const norm = (await import('../../app/js/normalizer.js')).default;
+
+/* ---------------------------- 1. 闪购签名 ---------------------------- */
+
+test('闪购签名与 node:crypto 的 md5 完全一致', () => {
+  const action = 'eleme.product.item.listItemsByCategoryId';
+  const token = 'token-abc';
+  const params = { categoryId: 1, page: 1, size: 20 };
+  const secret = 'secret-xyz';
+
+  const arr = Object.keys(params).map(k => k + '=' + JSON.stringify(params[k])).sort();
+  const raw = action + token + arr.join('') + secret;
+  const expect = crypto.createHash('md5').update(raw).digest('hex').toUpperCase();
+
+  assert.equal(sign({ action, token, params, secret }), expect);
+});
+
+test('签名对参数顺序不敏感（内部会排序）', () => {
+  const a = sign({ action: 'x.y', token: 't', params: { b: 2, a: 1 }, secret: 's' });
+  const b = sign({ action: 'x.y', token: 't', params: { a: 1, b: 2 }, secret: 's' });
+  assert.equal(a, b);
+});
+
+/* ---------------------------- 2. 出签解析 ---------------------------- */
+
+test('能解析标准格式的出签', () => {
+  const r = parseRecommendation('【红烧牛肉面】汤浓面弹，加班后来一碗正好。\n热汤下肚，万事可说。');
+  assert.equal(r.foodName, '红烧牛肉面');
+  assert.ok(r.reason.includes('汤浓面弹'));
+  assert.ok(r.blessing.includes('热汤下肚'));
+  assert.ok(['大吉', '中吉', '吉', '小吉'].includes(r.fortune));
+});
+
+test('模型不按格式输出时不抛错，返回 null', () => {
+  assert.equal(parseRecommendation('我觉得都可以，你看着办'), null);
+});
+
+test('空回复也能兜底', () => {
+  const r = fallbackRecommendation('', []);
+  assert.ok(r.foodName && r.blessing);
+});
+
+test('有附近商品时兜底优先用第一件', () => {
+  const r = fallbackRecommendation('', [{ name: '老街牛肉面（招牌）', price: 19.9, shop: '老街', source: 'meituan' }]);
+  assert.equal(r.foodName, '老街牛肉面');
+});
+
+test('提示词里带上了附近商品和联网资料，并强调优先附近', () => {
+  const p = buildSystemPrompt(
+    { city: '北京', currentFood: { name: '寿司' }, foods: [{ name: '寿司' }] },
+    [{ name: '双人火锅套餐', price: 159, shop: '闪电火锅', source: 'shangou' }],
+    '[1] 某店 双人餐 158 元'
+  );
+  assert.ok(p.includes('北京'));
+  assert.ok(p.includes('双人火锅套餐'));
+  assert.ok(p.includes('优先从「附近真实商品」里选'));
+  assert.ok(p.includes('闪购'));
+});
+
+/* ---------------------------- 3. 平台归一化 ---------------------------- */
+
+test('美团商品归一：价格、距离、来源', () => {
+  const p = norm.normalizeMeituanProduct({
+    productId: 12345,
+    productName: '酸菜鱼双人份',
+    currentPrice: 58,
+    originPrice: '88',
+    poiName: '川味小馆',
+    distanceText: '2.1km',
+    imageUrl: 'https://img/x.jpg',
+    tagList: [{ name: '免预约' }],
+  });
+  assert.equal(p.source, 'meituan');
+  assert.equal(p.id, '12345');
+  assert.equal(p.price, 58);
+  assert.equal(p.originPrice, 88);
+  assert.equal(p.shopName, '川味小馆');
+  assert.deepEqual(p.tags, ['免预约']);
+});
+
+test('美团字段缺名字时返回 null，不产生空卡片', () => {
+  assert.equal(norm.normalizeMeituanProduct({ productId: 1, price: 10 }), null);
+  assert.equal(norm.normalizeMeituanProduct(null), null);
+});
+
+test('闪购金额按「分」换算成元', () => {
+  const p = norm.normalizeShangouProduct({ id: 's1', name: '日式咖喱猪排饭', price: 3200, originalPrice: 4500 }, { shopId: '9', shopName: '深夜食堂' });
+  assert.equal(p.price, 32);
+  assert.equal(p.originPrice, 45);
+  assert.equal(p.shopName, '深夜食堂');
+});
+
+test('按距离排序：m 与 km 混排正确', () => {
+  const list = [
+    { title: '远', distanceText: '3km' },
+    { title: '无距离', distanceText: '' },
+    { title: '近', distanceText: '480m' },
+  ];
+  const sorted = norm.sortByDistance(list).map(x => x.title);
+  assert.deepEqual(sorted, ['近', '远', '无距离']);
+});
+
+test('去重：同来源同 id 只留一条', () => {
+  const list = [
+    { source: 'meituan', id: '1', title: 'A' },
+    { source: 'meituan', id: '1', title: 'A' },
+    { source: 'shangou', id: '1', title: 'A' },
+  ];
+  assert.equal(norm.dedupe(list).length, 2);
+});
+
+test('金额格式化', () => {
+  assert.equal(norm.money(19.94), '¥19.9');
+  assert.equal(norm.money(0), '');
+});
+
+/* ---------------------------- 4. 配置探测 ---------------------------- */
+
+test('没配美团 token 时如实报告未配置', () => {
+  assert.equal(meituanConfigured({}), false);
+  assert.equal(meituanConfigured({ MEITUAN_TOKEN: 'x' }), true);
+});

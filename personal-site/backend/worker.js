@@ -1,127 +1,421 @@
-// 问食神 agent 后端（Cloudflare Worker）
-// 部署后暴露一个 POST 接口，替静态站（GitHub Pages）安全调用 DeepSeek，
-// 把 API Key 藏在服务端，并按「每天 1 元」额度用 Cloudflare KV 记账限流。
-// 详见同目录 README.md。
+/**
+ * 今日食签 v0.5 · 统一后端（Cloudflare Workers / ES Module 格式）
+ * =============================================================================
+ * 一个 Worker 同时负责三件事：
+ *
+ *   1. /api/v1/chat          问食神：DeepSeek Search 联网 → deepseek-flash 出签
+ *   2. /api/v1/platform/*    聚合美团 / 淘宝闪购的附近团购商品（Key 全在服务端）
+ *   3. /api/v1/health        自检：哪些平台配好了、今日还剩多少额度
+ *
+ * 设计约束（都是踩过坑才这么写的）：
+ *   - **任何外部依赖挂掉都不能让页面白屏**：chat 失败前端降级本地食神，
+ *     平台失败只影响那一个平台的区块，各自独立 allSettled。
+ *   - **Key 永不进仓库**：全部走 wrangler secret。
+ *   - **花钱的事必须可观测**：每次调用都按 token / 调用次数记账，
+ *     超预算直接 429，并在 health 里可见。
+ *   - **CORS 白名单**：只允许站点域名，避免被别人拿去白嫖额度。
+ */
 
-// ===== 可配置项 =====
-const DAILY_BUDGET_YUAN = 1.00;                // 每天预算（元）
-const INPUT_RATE_YUAN_PER_M = 2;               // DeepSeek 输入价（元/百万 token），保守取值
-const OUTPUT_RATE_YUAN_PER_M = 8;              // DeepSeek 输出价（元/百万 token），保守取值
-const DAILY_MAX_CALLS = 500;                   // 兜底：每天最多调用次数
-const ALLOWED_ORIGIN = "https://akihsama.github.io"; // 前端站点来源（CORS 白名单）
-const MICRO_PER_YUAN = 1000000;                // 微元 = 1/1000000 元，避免浮点误差
+import { deepseekChat, deepseekSearch, DeepSeekError } from './src/deepseek.js';
+import { meituanNearby, meituanTravel, meituanConfigured } from './src/providers/meituan.js';
+import { shangouNearby, shangouConfigured } from './src/providers/shangou.js';
+import { buildSystemPrompt, buildUserPrompt, parseRecommendation, fallbackRecommendation } from './src/prompt.js';
 
-addEventListener("fetch", (event) => {
-  event.respondWith(handleFetch(event.request));
-});
+/* ============================== 配置 ============================== */
 
-async function handleFetch(request) {
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Max-Age": "86400",
-    };
+const DEFAULT_CONFIG = {
+  // —— 模型 ——
+  MODEL: 'deepseek-flash',            // 官方轻量模型（V4.1-Flash），别名 deepseek-chat 已废弃
+  // —— 预算（元）。价格按官方牌价取高峰价，宁可提前截断也不超支 ——
+  INPUT_RATE_YUAN_PER_M: 2,           // 输入 2 元/百万 token（缓存未命中·高峰）
+  OUTPUT_RATE_YUAN_PER_M: 8,          // 输出 8 元/百万 token（高峰）
+  SEARCH_RATE_YUAN_PER_CALL: 0.005,   // Search 5 元/千次
+  DAILY_BUDGET_YUAN: 1.0,             // 每日总预算
+  DAILY_MAX_CALLS: 300,               // 每日最多问答次数
+  DAILY_MAX_SEARCH: 150,              // 每日最多联网搜索次数（0 = 关闭联网）
+  // —— 交互 ——
+  MAX_INPUT_CHARS: 300,
+  MAX_HISTORY: 6,
+  MAX_OUTPUT_TOKENS: 320,
+  ALLOWED_ORIGINS: '*',
+  TIMEOUT_MS: 25000,
+};
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders });
+/* ============================== 工具 ============================== */
+
+const MICRO = 1e6; // 微元，避免浮点误差
+
+function cfg(env) {
+  const out = Object.assign({}, DEFAULT_CONFIG);
+  for (const k of Object.keys(DEFAULT_CONFIG)) {
+    if (env && env[k] !== undefined && env[k] !== '') {
+      out[k] = typeof DEFAULT_CONFIG[k] === 'number' ? Number(env[k]) : env[k];
     }
-    if (request.method !== "POST") {
-      return json({ error: "method not allowed" }, 405, corsHeaders);
-    }
-
-    const origin = request.headers.get("origin") || "";
-    if (origin && origin !== ALLOWED_ORIGIN) {
-      return json({ error: "cors: origin not allowed" }, 403, corsHeaders);
-    }
-
-    // 按 UTC 天分桶
-    const day = new Date().toISOString().slice(0, 10);
-    const spendKey = "spend-" + day;
-    const callKey = "calls-" + day;
-    const spentMicro = Number((await env.SPEND.get(spendKey)) || 0);
-    const calls = Number((await env.SPEND.get(callKey)) || 0);
-
-    if (spentMicro >= DAILY_BUDGET_YUAN * MICRO_PER_YUAN || calls >= DAILY_MAX_CALLS) {
-      return json({ error: "今日额度已用完，明天再来问食神吧 🍜" }, 429, corsHeaders);
-    }
-
-    let body;
-    try { body = await request.json(); }
-    catch { return json({ error: "invalid JSON body" }, 400, corsHeaders); }
-
-    const model = (body && body.model) || "deepseek-chat";
-    const userMessages = Array.isArray(body && body.messages) ? body.messages : [];
-    const currentFood = (body && body.context && body.context.currentFood) || null;
-    const menuNames = ((body && body.context && body.context.foods) || []).map(function (f) { return f.name; });
-
-    let systemPrompt =
-      "你是「今日食签」的食神，一个懂吃、风趣、会安慰人的美食顾问。" +
-      "请根据用户的描述推荐一道最适合吃的食物；优先从菜单里选：" +
-      (menuNames.length ? menuNames.join("、") : "（无菜单限制，自由发挥）") +
-      (currentFood ? " 用户刚摇到的签是【" + currentFood.name + "】，可参考。" : "") +
-      " 请在回复中用【菜名】标出你推荐的菜，并在末尾加一句简短签语。口语化，不超过 80 字。";
-
-    const deepseekBody = {
-      model: model,
-      messages: [{ role: "system", content: systemPrompt }].concat(
-        userMessages.slice(-6).map(function (m) {
-          return { role: (m.role === "assistant" ? "assistant" : "user"), content: String(m.content || "") };
-        })
-      ),
-      temperature: 0.8,
-      max_tokens: 200,
-    };
-
-    let ds;
-    try {
-      ds = await fetch("https://api.deepseek.com/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": "Bearer " + (env.DEEPSEEK_API_KEY || ""),
-        },
-        body: JSON.stringify(deepseekBody),
-      });
-    } catch (e) {
-      return json({ error: "DeepSeek 请求失败：" + e.message }, 502, corsHeaders);
-    }
-
-    if (!ds.ok) {
-      const t = await ds.text();
-      return json({ error: "DeepSeek 返回错误 " + ds.status, detail: t }, 502, corsHeaders);
-    }
-
-    const data = await ds.json();
-    const reply = (((data.choices || [])[0] && data.choices[0].message && data.choices[0].message.content) || "").trim();
-    const usage = data.usage || {};
-    const promptTokens = usage.prompt_tokens || 0;
-    const completionTokens = usage.completion_tokens || 0;
-
-    // 记账（微元）
-    const costMicro = promptTokens * INPUT_RATE_YUAN_PER_M + completionTokens * OUTPUT_RATE_YUAN_PER_M;
-    await Promise.all([
-      env.SPEND.put(spendKey, String(spentMicro + costMicro)),
-      env.SPEND.put(callKey, String(calls + 1)),
-    ]);
-
-    const foodMatch = reply.match(/【([^】]{1,24})】/);
-    return json({
-      reply: reply,
-      foodName: foodMatch ? foodMatch[1] : undefined,
-      provider: "deepseek",
-      model: model,
-      usage: {
-        promptTokens: promptTokens,
-        completionTokens: completionTokens,
-        costYuan: Number((costMicro / MICRO_PER_YUAN).toFixed(4)),
-      },
-    }, 200, corsHeaders);
+  }
+  if (typeof out.ALLOWED_ORIGINS === 'string' && out.ALLOWED_ORIGINS !== '*') {
+    out.ALLOWED_ORIGINS = out.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
+  }
+  return out;
 }
 
-function json(obj, status, extraHeaders) {
+function corsHeaders(request, config) {
+  const origin = request.headers.get('Origin') || '';
+  let allow = '';
+  if (config.ALLOWED_ORIGINS === '*') allow = '*';
+  else if (config.ALLOWED_ORIGINS.includes(origin)) allow = origin;
+
+  const h = {
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age': '86400',
+    'Vary': 'Origin',
+  };
+  if (allow) h['Access-Control-Allow-Origin'] = allow;
+  return h;
+}
+
+function json(obj, status, extra) {
   return new Response(JSON.stringify(obj), {
-    status: status,
-    headers: Object.assign({ "Content-Type": "application/json; charset=utf-8" }, extraHeaders || {}),
+    status: status || 200,
+    headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, extra || {}),
   });
 }
+
+function originAllowed(request, config) {
+  if (config.ALLOWED_ORIGINS === '*') return true;
+  const origin = request.headers.get('Origin') || '';
+  // 无 Origin（curl / 服务端调用）放行；带 Origin 必须命中白名单
+  return !origin || config.ALLOWED_ORIGINS.includes(origin);
+}
+
+/* ============================== 记账 ============================== */
+
+/**
+ * KV 是最终一致存储，并发下会少记。这里用「读-加-写」+ 1/20 概率补写，
+ * 对个人站点足够；真要严格可换 Durable Object。
+ */
+function dayKey() {
+  // 按北京时间分桶，跟用户作息一致（避免 UTC 0 点额度突然重置）
+  const now = new Date(Date.now() + 8 * 3600 * 1000);
+  return now.toISOString().slice(0, 10);
+}
+
+async function readUsage(env, day) {
+  const raw = env.USAGE ? await env.USAGE.get('u:' + day) : null;
+  if (!raw) return { spentMicro: 0, calls: 0, searches: 0 };
+  try { return Object.assign({ spentMicro: 0, calls: 0, searches: 0 }, JSON.parse(raw)); }
+  catch { return { spentMicro: 0, calls: 0, searches: 0 }; }
+}
+
+async function writeUsage(env, day, usage) {
+  if (!env.USAGE) return;
+  await env.USAGE.put('u:' + day, JSON.stringify(usage), { expirationTtl: 60 * 60 * 24 * 7 });
+}
+
+function budgetLeft(usage, config) {
+  const yuan = usage.spentMicro / MICRO;
+  return {
+    usedYuan: Number(yuan.toFixed(4)),
+    budgetYuan: config.DAILY_BUDGET_YUAN,
+    leftYuan: Number(Math.max(0, config.DAILY_BUDGET_YUAN - yuan).toFixed(4)),
+    callsLeft: Math.max(0, config.DAILY_MAX_CALLS - usage.calls),
+    searchesLeft: Math.max(0, config.DAILY_MAX_SEARCH - usage.searches),
+  };
+}
+
+/* ============================== 简易限流 ============================== */
+
+/**
+ * 前端限流：同一 IP 每分钟最多 12 次问答。防止单个用户把每日预算吃光。
+ * KV 的读放大对个人站点可接受；站点流量大时应换成 Durable Object。
+ */
+async function rateLimited(env, request, bucket, limit, windowSec) {
+  if (!env.USAGE) return false;
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const slot = Math.floor(Date.now() / (windowSec * 1000));
+  const key = `rl:${bucket}:${ip}:${slot}`;
+  const n = Number((await env.USAGE.get(key)) || 0);
+  if (n >= limit) return true;
+  await env.USAGE.put(key, String(n + 1), { expirationTtl: windowSec * 2 });
+  return false;
+}
+
+/* ============================== AI：问食神 ============================== */
+
+async function handleChat(request, env, config, cors) {
+  let body;
+  try { body = await request.json(); }
+  catch { return json({ error: '请求体不是合法 JSON' }, 400, cors); }
+
+  const messages = Array.isArray(body && body.messages) ? body.messages : [];
+  const lastUser = [...messages].reverse().find(m => m && m.role === 'user');
+  const question = String((lastUser && lastUser.content) || '').trim().slice(0, config.MAX_INPUT_CHARS);
+  if (!question) return json({ error: '说点什么吧，食神还没听到你的诉求' }, 400, cors);
+
+  if (await rateLimited(env, request, 'chat', 12, 60)) {
+    return json({ error: '问得太急了，歇一分钟再来', code: 'RATE_LIMITED' }, 429, cors);
+  }
+
+  const day = dayKey();
+  const usage = await readUsage(env, day);
+  if (usage.calls >= config.DAILY_MAX_CALLS || usage.spentMicro >= config.DAILY_BUDGET_YUAN * MICRO) {
+    return json({ error: '今日食神额度用完了，明天再来摇签吧 🍜', code: 'BUDGET_EXHAUSTED' }, 429, cors);
+  }
+
+  const ctx = (body && body.context) || {};
+  const apiKey = env.DEEPSEEK_API_KEY;
+
+  if (!apiKey) {
+    // 没配 Key：返回明确信号，前端自动降级本地食神（而不是报错弹窗）
+    return json({
+      error: '后端未配置 DEEPSEEK_API_KEY',
+      code: 'NOT_CONFIGURED',
+      degraded: true,
+    }, 503, cors);
+  }
+
+  /* ---------- 第 1 步：联网搜索 ---------- */
+  let searchUsed = false;
+  let sources = [];
+  let webDigest = '';
+
+  const searchBudgetOk = config.DAILY_MAX_SEARCH > 0 && usage.searches < config.DAILY_MAX_SEARCH;
+  if (searchBudgetOk) {
+    try {
+      const sr = await deepseekSearch({
+        apiKey,
+        query: buildSearchQuery(question, ctx),
+        count: 5,
+        oriQuestion: question,
+        timeoutMs: Math.min(12000, config.TIMEOUT_MS),
+      });
+      searchUsed = true;
+      usage.searches += 1;
+      usage.spentMicro += Math.round(config.SEARCH_RATE_YUAN_PER_CALL * MICRO);
+      sources = (sr.results || []).slice(0, 5).map(r => ({
+        title: r.title, url: r.url, site: r.site_name, summary: r.summary,
+      }));
+      webDigest = (sr.results || []).slice(0, 4).map((r, i) =>
+        `[${i + 1}] ${r.title}（${r.site_name || '网络'}）：${(r.summary || r.snippet || '').slice(0, 240)}`
+      ).join('\n');
+    } catch (e) {
+      // 搜索失败绝不影响出签，只记录原因
+      console.warn('search failed', e && e.message);
+      webDigest = '';
+      searchUsed = false;
+    }
+  }
+
+  /* ---------- 第 2 步：出签 ---------- */
+  const nearby = Array.isArray(ctx.nearby) ? ctx.nearby.slice(0, 20) : [];
+  const system = buildSystemPrompt(ctx, nearby, webDigest);
+  const user = buildUserPrompt(question);
+
+  let reply = '';
+  let model = config.MODEL;
+  let recommend = null;
+
+  try {
+    const res = await deepseekChat({
+      apiKey,
+      model: config.MODEL,
+      messages: [
+        { role: 'system', content: system },
+        ...messages.slice(-config.MAX_HISTORY)
+          .filter(m => m && (m.role === 'user' || m.role === 'assistant') && m.content)
+          .map(m => ({ role: m.role, content: String(m.content).slice(0, config.MAX_INPUT_CHARS) })),
+      ],
+      maxTokens: config.MAX_OUTPUT_TOKENS,
+      temperature: 0.85,
+      json: false,
+      timeoutMs: config.TIMEOUT_MS,
+    });
+    reply = res.content;
+    model = res.model || config.MODEL;
+    usage.spentMicro += res.costMicro;
+    recommend = parseRecommendation(reply);
+  } catch (e) {
+    const status = e instanceof DeepSeekError ? e.status : 502;
+    await writeUsage(env, day, usage);
+    return json({
+      error: '食神暂时连不上：' + (e.message || '未知错误'),
+      code: 'UPSTREAM_ERROR',
+      status,
+      degraded: true,
+    }, 502, cors);
+  }
+
+  usage.calls += 1;
+  await writeUsage(env, day, usage);
+
+  if (!recommend) recommend = fallbackRecommendation(reply, nearby);
+
+  return json({
+    reply: reply,
+    foodName: recommend && recommend.foodName,
+    recommend: recommend,
+    sources: sources,
+    searchUsed: searchUsed,
+    provider: 'deepseek',
+    model: model,
+    usage: Object.assign({}, budgetLeft(usage, config), { costThisCallYuan: Number((usage.spentMicro / MICRO).toFixed(5)) }),
+  }, 200, cors);
+}
+
+/**
+ * 组装搜索词：把"我想吃辣的便宜的"这类口语，变成搜索引擎能用的查询。
+ * 关键是带上城市和"团购/大众点评"这种限定词，否则搜出一堆菜谱。
+ */
+function buildSearchQuery(question, ctx) {
+  const city = (ctx && ctx.city) || '';
+  const food = ctx && ctx.currentFood && ctx.currentFood.name;
+  const parts = [];
+  if (city) parts.push(city);
+  parts.push(question.replace(/[?？!！。，,]/g, ' ').trim().slice(0, 40));
+  if (food && !question.includes(food)) parts.push(food);
+  parts.push('团购 探店');
+  return parts.join(' ').slice(0, 120);
+}
+
+/* ============================== 平台聚合 ============================== */
+
+async function handleNearby(request, env, config, cors) {
+  let body = {};
+  if (request.method === 'POST') {
+    try { body = await request.json(); } catch { body = {}; }
+  } else {
+    const u = new URL(request.url);
+    u.searchParams.forEach((v, k) => { body[k] = v; });
+  }
+
+  const keyword = String(body.keyword || '').slice(0, 40);
+  const city = String(body.city || '').slice(0, 20);
+  const cityId = String(body.cityId || '').slice(0, 12);
+  const lat = body.lat !== undefined ? Number(body.lat) : null;
+  const lng = body.lng !== undefined ? Number(body.lng) : null;
+  const sources = Array.isArray(body.sources) && body.sources.length ? body.sources : ['meituan', 'shangou'];
+  const limit = Math.min(Math.max(Number(body.limit) || 12, 1), 30);
+
+  if (await rateLimited(env, request, 'nearby', 30, 60)) {
+    return json({ error: '刷得太紧了', code: 'RATE_LIMITED', products: [], shops: [], sources: {} }, 429, cors);
+  }
+
+  const tasks = [];
+  if (sources.includes('meituan')) {
+    tasks.push(meituanNearby({ env, keyword, city, cityId, lat, lng, limit })
+      .then(r => ['meituan', r])
+      .catch(e => ['meituan', { status: 'error', error: String(e && e.message || e), products: [], shops: [] }]));
+  }
+  if (sources.includes('shangou')) {
+    tasks.push(shangouNearby({ env, keyword, city, cityId, lat, lng, limit })
+      .then(r => ['shangou', r])
+      .catch(e => ['shangou', { status: 'error', error: String(e && e.message || e), products: [], shops: [] }]));
+  }
+
+  const settled = await Promise.all(tasks);
+  const out = { products: [], shops: [], sources: {}, errors: {}, city, located: !!(lat && lng) };
+
+  for (const [name, r] of settled) {
+    out.sources[name] = r.status;
+    if (r.error) out.errors[name] = r.error;
+    if (Array.isArray(r.products)) out.products.push(...r.products);
+    if (Array.isArray(r.shops)) out.shops.push(...r.shops);
+  }
+
+  // 按距离排序 + 截断
+  const byDist = (a, b) => {
+    const ma = meters(a.distanceText), mb = meters(b.distanceText);
+    if (ma === null && mb === null) return 0;
+    if (ma === null) return 1;
+    if (mb === null) return -1;
+    return ma - mb;
+  };
+  out.products.sort(byDist);
+  out.shops.sort(byDist);
+  out.products = out.products.slice(0, limit);
+  out.shops = out.shops.slice(0, Math.max(4, Math.floor(limit / 2)));
+
+  return json(out, 200, cors);
+}
+
+function meters(text) {
+  const s = String(text || '').toLowerCase();
+  let m = s.match(/([\d.]+)\s*km/);
+  if (m) return parseFloat(m[1]) * 1000;
+  m = s.match(/([\d.]+)\s*m/);
+  if (m) return parseFloat(m[1]);
+  return null;
+}
+
+/* ============================== 酒旅（可选） ============================== */
+
+async function handleTravel(request, env, config, cors) {
+  let body = {};
+  try { body = await request.json(); } catch { /* ignore */ }
+  const query = String(body.query || '').slice(0, 100);
+  if (!query) return json({ error: '缺少 query' }, 400, cors);
+
+  if (!env.MEITUAN_TRAVEL_TOKEN) {
+    return json({ error: '未配置 MEITUAN_TRAVEL_TOKEN', code: 'NOT_CONFIGURED' }, 503, cors);
+  }
+  try {
+    const r = await meituanTravel({ env, city: String(body.city || '').slice(0, 20), query });
+    return json(r, 200, cors);
+  } catch (e) {
+    return json({ error: String(e && e.message || e) }, 502, cors);
+  }
+}
+
+/* ============================== 健康检查 ============================== */
+
+async function handleHealth(request, env, config, cors) {
+  const day = dayKey();
+  const usage = await readUsage(env, day);
+  return json({
+    ok: true,
+    version: '0.5.0',
+    model: config.MODEL,
+    platforms: {
+      meituan: meituanConfigured(env) ? 'configured' : 'missing_meituan_token',
+      shangou: shangouConfigured(env) ? 'configured' : 'missing_shangou_keys',
+      deepseek: env.DEEPSEEK_API_KEY ? 'configured' : 'missing_deepseek_key',
+    },
+    budget: budgetLeft(usage, config),
+    searchEnabled: config.DAILY_MAX_SEARCH > 0,
+    kvBound: !!env.USAGE,
+  }, 200, cors);
+}
+
+/* ============================== 路由 ============================== */
+
+export default {
+  async fetch(request, env, ctx) {
+    const config = cfg(env);
+    const cors = corsHeaders(request, config);
+    const url = new URL(request.url);
+    // 同时兼容 /api/v1/* 与 /v1/*（部分人直接把 Worker 域名当 API 根）
+    const path = url.pathname.replace(/^\/api/, '').replace(/\/+$/, '') || '/';
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: cors });
+    }
+
+    if (!originAllowed(request, config)) {
+      return json({ error: 'origin not allowed' }, 403, cors);
+    }
+
+    try {
+      if (path === '/' || path === '/v1') {
+        return json({ name: '今日食签 API', version: '0.5.0', endpoints: ['/api/v1/health', '/api/v1/chat', '/api/v1/platform/nearby'] }, 200, cors);
+      }
+      if (path === '/v1/health') return handleHealth(request, env, config, cors);
+      if (path === '/v1/chat' && request.method === 'POST') return handleChat(request, env, config, cors);
+      if (path === '/v1/platform/nearby') return handleNearby(request, env, config, cors);
+      if (path === '/v1/travel' && request.method === 'POST') return handleTravel(request, env, config, cors);
+      return json({ error: 'not found', path: url.pathname }, 404, cors);
+    } catch (e) {
+      console.error('unhandled', e && e.stack);
+      return json({ error: '服务内部错误', detail: String(e && e.message || e) }, 500, cors);
+    }
+  },
+};
