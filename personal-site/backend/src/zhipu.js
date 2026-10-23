@@ -76,7 +76,7 @@ async function post(path, apiKey, body, timeoutMs) {
 }
 
 /** 一轮对话。返回 { content, model, usage, costMicro } */
-export async function zhipuChat({ apiKey, model, messages, maxTokens, temperature, json, timeoutMs }) {
+export async function zhipuChat({ apiKey, model, messages, maxTokens, temperature, json, timeoutMs, thinking }) {
   const body = {
     model,
     messages,
@@ -84,24 +84,48 @@ export async function zhipuChat({ apiKey, model, messages, maxTokens, temperatur
     temperature: typeof temperature === 'number' ? temperature : 0.85,
     stream: false,
   };
+  // GLM-4.5 起默认开启思考模式，reasoning 与 content 共用 max_tokens。
+  // 实测：320 的预算会被思考吃光，content 返回空串（finish_reason=length）。
+  // 出签不需要推理链，一律关闭；实测同样提示词 28 token 出完，1.3s。
+  body.thinking = { type: thinking === 'enabled' ? 'enabled' : 'disabled' };
   if (json) body.response_format = { type: 'json_object' };
 
   const data = await post('/chat/completions', apiKey, body, timeoutMs);
   const choice = (data.choices || [])[0] || {};
-  const content = String((choice.message && choice.message.content) || '').trim();
-  if (!content) throw new ZhipuError('模型返回空内容', 502);
+  const message = choice.message || {};
+  let content = String(message.content || '').trim();
 
+  // 兜底：万一某些型号忽略 thinking 开关，把 reasoning 吃满导致 content 为空，
+  // 不要把空串当成「上游故障」，而是重试一次更短的请求（预算翻倍、仍关思考）。
+  if (!content) {
+    const reason = message.reasoning_content;
+    if (reason) {
+      const retry = await post('/chat/completions', apiKey, Object.assign({}, body, {
+        max_tokens: Math.max((maxTokens || 320) * 2, 512),
+      }), timeoutMs);
+      const c2 = (retry.choices || [])[0] || {};
+      content = String((c2.message && c2.message.content) || '').trim();
+      if (content) {
+        return finish(retry, model, content);
+      }
+    }
+    throw new ZhipuError('模型返回空内容', 502);
+  }
+
+  return finish(data, model, content);
+}
+
+function finish(data, fallbackModel, content) {
   const u = data.usage || {};
   const promptTokens = u.prompt_tokens || 0;
   const completionTokens = u.completion_tokens || 0;
-  const costMicro = isFreeModel(data.model || model)
-    ? 0
-    : Math.round(promptTokens * PAID_RATE.inputPerM + completionTokens * PAID_RATE.outputPerM);
-
+  const usedModel = data.model || fallbackModel;
   return {
     content,
-    model: data.model || model,
+    model: usedModel,
     usage: { promptTokens, completionTokens, totalTokens: u.total_tokens || 0 },
-    costMicro,
+    costMicro: isFreeModel(usedModel)
+      ? 0
+      : Math.round(promptTokens * PAID_RATE.inputPerM + completionTokens * PAID_RATE.outputPerM),
   };
 }

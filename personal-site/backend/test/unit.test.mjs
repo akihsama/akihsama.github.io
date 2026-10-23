@@ -16,7 +16,7 @@ import { meituanConfigured } from '../src/providers/meituan.js';
 import {
   aiProviderName, aiConfigured, aiMissingHint, aiModelName, aiSearchSupported,
 } from '../src/ai.js';
-import { isFreeModel } from '../src/zhipu.js';
+import { isFreeModel, zhipuChat } from '../src/zhipu.js';
 
 const norm = (await import('../../app/js/normalizer.js')).default;
 
@@ -184,4 +184,51 @@ test('免费模型不记钱，付费型号按保守估价记', () => {
   assert.equal(isFreeModel('glm-4.5-air'), true);
   assert.equal(isFreeModel('glm-4.7'), false, '常规型号是付费的');
   assert.equal(isFreeModel(''), false);
+});
+
+/* ------------------- 6. 智谱请求体：必须关思考 ------------------- */
+
+test('智谱请求体默认关闭思考模式（否则 320 token 会被 reasoning 吃光）', async () => {
+  // 拦截 fetch，检查真正发出去的 body
+  const captured = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    captured.push({ url: String(url), body: JSON.parse(init.body) });
+    return new Response(JSON.stringify({
+      model: 'glm-4.7-flash',
+      choices: [{ message: { content: '【牛肉面】\n汤浓面弹' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 154, completion_tokens: 28, total_tokens: 182 },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    const res = await zhipuChat({
+      apiKey: 'k', model: 'glm-4.7-flash',
+      messages: [{ role: 'user', content: 'hi' }], maxTokens: 320,
+    });
+    assert.deepEqual(captured[0].body.thinking, { type: 'disabled' }, '必须显式 disabled');
+    assert.equal(res.content, '【牛肉面】\n汤浓面弹');
+    assert.equal(res.costMicro, 0, '免费型号记账必须为 0');
+    assert.equal(res.usage.promptTokens, 154);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('content 为空但有 reasoning 时自动重试一次，而不是直接报错', async () => {
+  let n = 0;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    n += 1;
+    const body = n === 1
+      ? { choices: [{ message: { content: '', reasoning_content: '思考中...' }, finish_reason: 'length' }] }
+      : { model: 'glm-4.7-flash', choices: [{ message: { content: '【小炒肉】\n够辣够下饭' } }], usage: {} };
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    const res = await zhipuChat({ apiKey: 'k', model: 'glm-4.7-flash', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(n, 2, '应该重试一次');
+    assert.equal(res.content, '【小炒肉】\n够辣够下饭');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });
