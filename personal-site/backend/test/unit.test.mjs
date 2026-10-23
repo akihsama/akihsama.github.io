@@ -17,6 +17,7 @@ import {
   aiProviderName, aiConfigured, aiMissingHint, aiModelName, aiSearchSupported,
 } from '../src/ai.js';
 import { isFreeModel, zhipuChat } from '../src/zhipu.js';
+import { matchOrigin } from '../worker.js';
 
 const norm = (await import('../../app/js/normalizer.js')).default;
 
@@ -272,4 +273,34 @@ test('401 不重试，立刻抛出（避免拿错 Key 空转）', async () => {
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+/* ---------------- 7. CORS 白名单（支持 pages.dev 通配）---------------- */
+
+test('精确匹配照旧可用', () => {
+  const list = ['https://akihsama.github.io'];
+  assert.equal(matchOrigin('https://akihsama.github.io', list), true);
+  assert.equal(matchOrigin('https://akihsama.github.io.evil.com', list), false);
+  assert.equal(matchOrigin('http://akihsama.github.io', list), false, '协议不同不算同源');
+});
+
+test('https://*.pages.dev 放行项目域名与部署哈希域名', () => {
+  const list = ['https://*.pages.dev'];
+  assert.equal(matchOrigin('https://shiqian.pages.dev', list), true);
+  assert.equal(matchOrigin('https://a1b2c3d4.shiqian.pages.dev', list), true);
+  assert.equal(matchOrigin('https://a.b.shiqian.pages.dev', list), true);
+});
+
+test('通配不会误放行外站', () => {
+  const list = ['https://*.pages.dev'];
+  assert.equal(matchOrigin('https://pages.dev.evil.com', list), false, '后缀必须在最后');
+  assert.equal(matchOrigin('https://evil-pages.dev', list), false, '没有点分隔不算子域');
+  assert.equal(matchOrigin('http://x.pages.dev', list), false, '必须 https');
+  assert.equal(matchOrigin('https://x.pages.dev/evil', list), false, 'Origin 里不该有路径');
+  assert.equal(matchOrigin('', list), false);
+});
+
+test('只接受 https://*.xxx 形式，避免写成 https://* 全网放行', () => {
+  assert.equal(matchOrigin('https://anything.com', ['https://*']), false);
+  assert.equal(matchOrigin('https://anything.com', ['*']), false, '裸 * 在 cfg 层已单独处理，这里不当通配');
 });
