@@ -2,6 +2,9 @@ backend/.wrangler/
 backend/.dev.vars
 backend/node_modules/
 backend/package-lock.json
+deploy/deploy.env
+deploy/frontend.conf
+deploy/.deployed-url
 .sass-cache/
 .jekyll-cache/
 _site/
