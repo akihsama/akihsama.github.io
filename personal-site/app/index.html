@@ -1049,9 +1049,9 @@
     <div class="llm-section">
       <div class="section-title-row">
         <div class="section-title">✨ 问问食神</div>
-        <span class="agent-badge" id="agentBadge">deepseek-flash</span>
+        <span class="agent-badge" id="agentBadge">glm-4.7-flash</span>
       </div>
-      <div class="agent-hint" id="agentHint">食神会先联网查附近的真实门店与团购，再给你出签。后端未配置时自动降级为本地食神。</div>
+      <div class="agent-hint" id="agentHint">食神会结合城市、口味与附近真实门店给你出签。后端未配置或限流时自动降级为本地食神。</div>
       <div class="llm-input-area">
         <input type="text" class="llm-input" id="llmInput" maxlength="300" autocomplete="off" placeholder="想吃什么？说说口味、预算或场景..." onkeydown="handleKeyDown(event)">
         <button type="button" class="llm-send-btn" id="llmSendBtn" onclick="sendLLM()">发送</button>
@@ -1209,7 +1209,7 @@
   // 请求：{ messages, context: { city, lat, lng, foods[], currentFood, prefs[] } }
   // 响应：{ reply, foodName?, recommend?, sources?[], model, provider, usage }
   const AGENT_CONFIG = Object.freeze({
-    model: 'deepseek-flash',
+    model: 'glm-4.7-flash',
     timeoutMs: 40000,
     fallbackToLocal: true,
     maxHistoryMessages: 8
@@ -1636,15 +1636,15 @@
 
       renderAgentReply(
         reply,
-        '美团 · 闪购 · 联网搜索',
-        'deepseek',
+        payload.searchUsed ? '美团 · 闪购 · 联网搜索' : '美团 · 闪购',
+        payload.provider || 'ai',
         payload.model || AGENT_CONFIG.model,
         payload.sources || []
       );
       document.getElementById('agentBadge').textContent = payload.model || AGENT_CONFIG.model;
       document.getElementById('agentHint').textContent = payload.searchUsed
         ? '本条回复已联网核对附近真实门店与团购。'
-        : '本条回复未触发联网（后端搜索额度或配置受限）。';
+        : '本条回复基于城市、口味与附近平台数据生成（未联网搜索）。';
       conversation.push({ role: 'assistant', content: reply });
 
       if (food) {

@@ -16,7 +16,10 @@
  *   - **CORS 白名单**：只允许站点域名，避免被别人拿去白嫖额度。
  */
 
-import { deepseekChat, deepseekSearch, DeepSeekError } from './src/deepseek.js';
+import {
+  aiChat, aiSearch, aiConfigured, aiProviderName, aiModelName, aiMissingHint, aiSearchSupported,
+  DeepSeekError, ZhipuError,
+} from './src/ai.js';
 import { meituanNearby, meituanTravel, meituanConfigured } from './src/providers/meituan.js';
 import { shangouNearby, shangouConfigured } from './src/providers/shangou.js';
 import { buildSystemPrompt, buildUserPrompt, parseRecommendation, fallbackRecommendation } from './src/prompt.js';
@@ -24,10 +27,11 @@ import { buildSystemPrompt, buildUserPrompt, parseRecommendation, fallbackRecomm
 /* ============================== 配置 ============================== */
 
 const DEFAULT_CONFIG = {
-  // —— 模型 ——
-  MODEL: 'deepseek-flash',            // 官方轻量模型（V4.1-Flash），别名 deepseek-chat 已废弃
+  // —— AI 提供商：zhipu（智谱 GLM，免费）| deepseek（按 token 计费）——
+  AI_PROVIDER: 'zhipu',
+  MODEL: 'glm-4.7-flash',             // 智谱默认；切 deepseek 时下面的 aiModelName 会自动改写
   // —— 预算（元）。价格按官方牌价取高峰价，宁可提前截断也不超支 ——
-  INPUT_RATE_YUAN_PER_M: 2,           // 输入 2 元/百万 token（缓存未命中·高峰）
+  INPUT_RATE_YUAN_PER_M: 2,           // 输入 2 元/百万 token（DeepSeek 缓存未命中·高峰）
   OUTPUT_RATE_YUAN_PER_M: 8,          // 输出 8 元/百万 token（高峰）
   SEARCH_RATE_YUAN_PER_CALL: 0.005,   // Search 5 元/千次
   DAILY_BUDGET_YUAN: 1.0,             // 每日总预算
@@ -163,27 +167,32 @@ async function handleChat(request, env, config, cors) {
   }
 
   const ctx = (body && body.context) || {};
-  const apiKey = env.DEEPSEEK_API_KEY;
+  const provider = aiProviderName(env);
 
-  if (!apiKey) {
+  if (!aiConfigured(env)) {
     // 没配 Key：返回明确信号，前端自动降级本地食神（而不是报错弹窗）
     return json({
-      error: '后端未配置 DEEPSEEK_API_KEY',
+      error: '后端未配置 ' + (provider === 'deepseek' ? 'DEEPSEEK_API_KEY' : 'ZHIPU_API_KEY'),
       code: 'NOT_CONFIGURED',
+      provider,
       degraded: true,
     }, 503, cors);
   }
 
-  /* ---------- 第 1 步：联网搜索 ---------- */
+  /* ---------- 第 1 步：联网搜索（只有 DeepSeek 支持）---------- */
   let searchUsed = false;
   let sources = [];
   let webDigest = '';
+  const searchApiKey = env.DEEPSEEK_API_KEY;
 
-  const searchBudgetOk = config.DAILY_MAX_SEARCH > 0 && usage.searches < config.DAILY_MAX_SEARCH;
+  const searchBudgetOk = aiSearchSupported(env)
+    && !!searchApiKey
+    && config.DAILY_MAX_SEARCH > 0
+    && usage.searches < config.DAILY_MAX_SEARCH;
   if (searchBudgetOk) {
     try {
-      const sr = await deepseekSearch({
-        apiKey,
+      const sr = await aiSearch({
+        env,
         query: buildSearchQuery(question, ctx),
         count: 5,
         oriQuestion: question,
@@ -212,13 +221,13 @@ async function handleChat(request, env, config, cors) {
   const user = buildUserPrompt(question);
 
   let reply = '';
-  let model = config.MODEL;
+  let model = aiModelName(env, config);
   let recommend = null;
 
   try {
-    const res = await deepseekChat({
-      apiKey,
-      model: config.MODEL,
+    const res = await aiChat({
+      env,
+      config,
       messages: [
         { role: 'system', content: system },
         ...messages.slice(-config.MAX_HISTORY)
@@ -231,15 +240,16 @@ async function handleChat(request, env, config, cors) {
       timeoutMs: config.TIMEOUT_MS,
     });
     reply = res.content;
-    model = res.model || config.MODEL;
+    model = res.model || model;
     usage.spentMicro += res.costMicro;
     recommend = parseRecommendation(reply);
   } catch (e) {
-    const status = e instanceof DeepSeekError ? e.status : 502;
+    const status = (e instanceof DeepSeekError || e instanceof ZhipuError) ? e.status : 502;
     await writeUsage(env, day, usage);
     return json({
       error: '食神暂时连不上：' + (e.message || '未知错误'),
       code: 'UPSTREAM_ERROR',
+      provider,
       status,
       degraded: true,
     }, 502, cors);
@@ -256,7 +266,7 @@ async function handleChat(request, env, config, cors) {
     recommend: recommend,
     sources: sources,
     searchUsed: searchUsed,
-    provider: 'deepseek',
+    provider: provider,
     model: model,
     usage: Object.assign({}, budgetLeft(usage, config), { costThisCallYuan: Number((usage.spentMicro / MICRO).toFixed(5)) }),
   }, 200, cors);
@@ -371,17 +381,20 @@ async function handleTravel(request, env, config, cors) {
 async function handleHealth(request, env, config, cors) {
   const day = dayKey();
   const usage = await readUsage(env, day);
+  const provider = aiProviderName(env);
   return json({
     ok: true,
     version: '0.5.0',
-    model: config.MODEL,
+    model: aiModelName(env, config),
+    aiProvider: provider,
     platforms: {
       meituan: meituanConfigured(env) ? 'configured' : 'missing_meituan_token',
       shangou: shangouConfigured(env) ? 'configured' : 'missing_shangou_keys',
+      ai: aiConfigured(env) ? 'configured' : aiMissingHint(env),
       deepseek: env.DEEPSEEK_API_KEY ? 'configured' : 'missing_deepseek_key',
     },
+    searchEnabled: aiSearchSupported(env) && config.DAILY_MAX_SEARCH > 0,
     budget: budgetLeft(usage, config),
-    searchEnabled: config.DAILY_MAX_SEARCH > 0,
     kvBound: !!env.USAGE,
   }, 200, cors);
 }

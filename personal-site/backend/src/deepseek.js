@@ -112,3 +112,8 @@ export async function deepseekSearch({ apiKey, query, count, oriQuestion, timeou
     results: results.filter(r => r && r.url && (r.rerank_score == null || r.rerank_score >= 0.8)),
   };
 }
+
+/** 是否配了 DeepSeek Key（搜索 API 只有这家有，独立于聊天模型选择） */
+export function deepseekConfigured(env) {
+  return !!(env && env.DEEPSEEK_API_KEY);
+}

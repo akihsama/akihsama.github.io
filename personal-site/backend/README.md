@@ -1,11 +1,11 @@
 # 今日食签 v0.5 后端
 
-一个 Cloudflare Worker，同时干三件事：**问食神（DeepSeek）**、**附近可下单（美团 / 淘宝闪购）**、**自检**。
+一个 Cloudflare Worker，同时干三件事：**问食神（智谱 GLM / 可选 DeepSeek）**、**附近可下单（美团 / 淘宝闪购）**、**自检**。
 所有密钥留在服务端，浏览器只打自己的 `/api/*`。
 
 ```
 浏览器 app/index.html
-  │  /api/v1/chat            ──► DeepSeek Search（联网）──► deepseek-flash（出签）
+  │  /api/v1/chat            ──► [DeepSeek Search 联网] ──► glm-4.7-flash / deepseek-flash（出签）
   │  /api/v1/platform/nearby ──► 美团到店团购  ┐
   │                          └─► 淘宝闪购      ┘  并发、各自降级
   │  /api/v1/health          ──► 平台配置状态 + 今日预算余量
@@ -17,12 +17,23 @@ Cloudflare Worker（Key 全在这里，KV 记账 / 限流）
 
 ## 一、为什么是这套模型和接口
 
+对话模型做成了一层薄抽象（`src/ai.js`），换家只改 `wrangler.toml` 的 `[vars]`，**代码不用动**：
+
 | 项目 | 选择 | 理由 |
 |---|---|---|
-| 出签模型 | `deepseek-flash`（V4.1-Flash） | 官方当前轻量档，1M 上下文、支持 JSON 输出；旧的 `deepseek-chat` / `deepseek-reasoner` 官方已公告废弃，别再写死 |
-| 联网 | `POST https://api.deepseek.com/v1/tools/search` | 官方自研搜索引擎，5 元 / 千次成功请求；返回结构化的 `title / url / summary / site_name / rerank_score` |
-| 记账单价 | 输入 2 元、输出 8 元（每百万 token） | 取**高峰价**，空闲时段官方半价，所以只会高估不会超支 |
+| 默认出签模型 | `glm-4.7-flash`（智谱） | 输入输出**全免费、不限量**，中文稳，国内直连快。免费层的代价是并发限制（约 1 路），失败就降级本地食神 |
+| 备选出签模型 | `deepseek-flash` | 按 token 计费，质量略高；旧的 `deepseek-chat` / `deepseek-reasoner` 已公告废弃，别再写死 |
+| 联网 | `POST https://api.deepseek.com/v1/tools/search` | 只有 DeepSeek 有自研搜索 API，5 元 / 千次成功请求；智谱免费模型不开放检索，所以 `AI_PROVIDER=zhipu` 时**自动关闭**联网，不产生无意义调用 |
+| 记账单价 | DeepSeek 输入 2 元、输出 8 元（每百万 token） | 取**高峰价**，空闲时段官方半价，所以只会高估不会超支；智谱 `*-flash` 记 0 元 |
 | 平台 | 美团到店团购 + 淘宝闪购开放平台 | 都是官方通道；商家 OpenAPI 需要企业资质且面向"管店"，不适合本场景 |
+
+切换方式（改完重新 `wrangler deploy` 即可）：
+
+```toml
+[vars]
+AI_PROVIDER = "zhipu"        # zhipu | deepseek
+MODEL = "glm-4.7-flash"      # 若与 AI_PROVIDER 不匹配，会自动纠正到该家的默认模型，不会 400
+```
 
 > 联网搜索可开关：`DAILY_MAX_SEARCH = 0` 即完全关闭，出签仍能工作，只是少了实时门店信息。
 
@@ -39,7 +50,8 @@ wrangler login
 wrangler kv namespace create USAGE
 
 # 2) 填密钥（交互输入，不落盘、不进 Git）
-wrangler secret put DEEPSEEK_API_KEY        # 必填，否则 /v1/chat 返回 503 由前端降级
+wrangler secret put ZHIPU_API_KEY           # 必填（AI_PROVIDER=zhipu），否则 /v1/chat 返回 503 由前端降级
+wrangler secret put DEEPSEEK_API_KEY        # 选填，改用 DeepSeek 或想开联网搜索时才需要
 wrangler secret put MEITUAN_TOKEN           # 选填，美团团购搜索
 wrangler secret put SHANGOU_APP_KEY         # 选填，淘宝闪购
 wrangler secret put SHANGOU_APP_SECRET
@@ -61,7 +73,10 @@ const API_BASE = 'https://shiqian-agent.<子域>.workers.dev';
 打开 `API_BASE + /api/v1/health` 应该看到：
 
 ```json
-{ "ok": true, "platforms": { "meituan": "configured", "shangou": "configured", "deepseek": "configured" },
+{ "ok": true, "aiProvider": "zhipu", "model": "glm-4.7-flash",
+  "platforms": { "meituan": "configured", "shangou": "missing_shangou_keys",
+                 "ai": "configured", "deepseek": "missing_deepseek_key" },
+  "searchEnabled": false,
   "budget": { "usedYuan": 0, "leftYuan": 1, "callsLeft": 300 } }
 ```
 
@@ -133,7 +148,8 @@ signature = UPPER( md5( action + token + sortedKeyValuePairs.join('') + app_secr
   "recommend": { "foodName": "牛肉面", "reason": "...", "blessing": "...", "fortune": "中吉", "emoji": "🍜" },
   "sources": [{ "title": "...", "url": "...", "site": "大众点评" }],
   "searchUsed": true,
-  "model": "deepseek-flash",
+  "provider": "zhipu",
+  "model": "glm-4.7-flash",
   "usage": { "usedYuan": 0.004, "leftYuan": 0.996, "callsLeft": 299 }
 }
 ```

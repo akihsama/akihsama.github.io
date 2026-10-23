@@ -116,7 +116,8 @@
 
   /* ------------------------------ AI ------------------------------ */
   /**
-   * 问食神。后端会先调 DeepSeek Search 拿实时信息，再让 deepseek-flash 出签。
+   * 问食神。后端默认用智谱 glm-4.7-flash 出签（免费），
+   * 若配了 DeepSeek Key 并可联网，会先搜实时信息再出签。
    * @returns {Promise<{reply:string, foodName?:string, recommend?:Object, sources?:Array, model?:string, usage?:Object}>}
    */
   function chat(payload) {

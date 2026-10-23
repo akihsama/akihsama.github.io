@@ -3,9 +3,13 @@
 ## v0.5（work/v0.5 分支）
 
 ### 新增
-- **问食神接入 DeepSeek 轻量模型 + 联网搜索**
-  后端改用官方 `deepseek-flash`（V4.1-Flash），并接入官方 Search API
-  （`/v1/tools/search`）拿实时门店与团购信息，再出签；回复底部展示参考来源。
+- **问食神接入大模型 + 可切换提供商**
+  默认走智谱 `glm-4.7-flash`（输入输出全免费），`AI_PROVIDER=deepseek` 可切到
+  `deepseek-flash`；切家只改 `wrangler.toml` 的 `[vars]`，代码不动。
+  配了 DeepSeek Key 且走 deepseek 时，会先调官方 Search API（`/v1/tools/search`）
+  拿实时门店与团购信息再出签，回复底部展示参考来源。
+- **AI 提供商抽象层**（`backend/src/ai.js`）：`aiChat / aiSearch / aiConfigured /
+  aiModelName`，模型名与提供商不匹配时自动纠正，避免 400；智谱档自动关闭付费联网。
 - **附近可下单面板**：并发拉取美团到店团购与淘宝闪购，统一结构渲染，
   单平台失败只影响自己那一块，其它照常。
 - **签卡直连商品**：翻开食签卡时，自动用菜名去平台搜一次，有落地页就给「去下单」按钮。
@@ -13,11 +17,12 @@
   纯函数、可单测，前后端共用。
 - **后端路由体系**：`/api/v1/health`、`/api/v1/chat`、`/api/v1/platform/nearby`、`/api/v1/travel`。
 - **成本与防刷**：按 token + 搜索次数记账（KV），日预算 / 日次数 / 单 IP 限流三道闸。
-- **CI**：`.github/workflows/backend-ci.yml`，语法检查 + 14 项单测。
+- **CI**：`.github/workflows/backend-ci.yml`，语法检查 + 19 项单测。
 
 ### 修复
 - 签卡 `overflow: hidden` 导致新增内容被裁切 → 改为自适应高度 + 内部滚动。
-- 旧版 `deepseek-chat` 模型名已废弃 → 统一为 `deepseek-flash`，并支持环境变量覆盖。
+- 旧版 `deepseek-chat` 模型名已废弃 → 不再写死具体型号，由 `AI_PROVIDER` 决定默认值。
+- 单测从 14 项增加到 19 项，新增覆盖提供商选择、Key 探测、模型名纠正、免费模型记账。
 - 旧版 Worker 用 Service Worker 写法且 `env` 作用域错误 → 重写为 ES Module。
 
 ### 说明（能力边界，避免误解）

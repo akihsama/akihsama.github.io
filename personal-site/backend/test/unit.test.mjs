@@ -13,6 +13,10 @@ import crypto from 'node:crypto';
 import { sign } from '../src/providers/shangou.js';
 import { parseRecommendation, fallbackRecommendation, buildSystemPrompt } from '../src/prompt.js';
 import { meituanConfigured } from '../src/providers/meituan.js';
+import {
+  aiProviderName, aiConfigured, aiMissingHint, aiModelName, aiSearchSupported,
+} from '../src/ai.js';
+import { isFreeModel } from '../src/zhipu.js';
 
 const norm = (await import('../../app/js/normalizer.js')).default;
 
@@ -135,4 +139,49 @@ test('金额格式化', () => {
 test('没配美团 token 时如实报告未配置', () => {
   assert.equal(meituanConfigured({}), false);
   assert.equal(meituanConfigured({ MEITUAN_TOKEN: 'x' }), true);
+});
+
+/* ---------------------- 5. AI 提供商抽象层 ---------------------- */
+
+test('默认走智谱，且只有显式写 deepseek 才切换', () => {
+  assert.equal(aiProviderName({}), 'zhipu');
+  assert.equal(aiProviderName({ AI_PROVIDER: '' }), 'zhipu');
+  assert.equal(aiProviderName({ AI_PROVIDER: 'zhipu' }), 'zhipu');
+  assert.equal(aiProviderName({ AI_PROVIDER: 'DeepSeek' }), 'deepseek');
+  assert.equal(aiProviderName({ AI_PROVIDER: 'openai' }), 'zhipu', '未知值必须回落到默认，而不是崩');
+});
+
+test('配置探测按提供商各认各的 Key', () => {
+  assert.equal(aiConfigured({ ZHIPU_API_KEY: 'z' }), true);
+  assert.equal(aiConfigured({ DEEPSEEK_API_KEY: 'd' }), false, '没切 provider 时 DeepSeek Key 不该放行');
+  assert.equal(aiConfigured({ AI_PROVIDER: 'deepseek', DEEPSEEK_API_KEY: 'd' }), true);
+  assert.equal(aiConfigured({ AI_PROVIDER: 'deepseek', ZHIPU_API_KEY: 'z' }), false);
+  assert.equal(aiMissingHint({}), 'missing_zhipu_key');
+  assert.equal(aiMissingHint({ AI_PROVIDER: 'deepseek' }), 'missing_deepseek_key');
+});
+
+test('模型名跟着提供商走，防止「切了家忘改模型名」拿到 400', () => {
+  // wrangler.toml 默认写 glm-4.7-flash
+  assert.equal(aiModelName({}, { MODEL: 'glm-4.7-flash' }), 'glm-4.7-flash');
+  // 切到 deepseek 但忘了改 MODEL：自动改成 deepseek-flash
+  assert.equal(aiModelName({ AI_PROVIDER: 'deepseek' }, { MODEL: 'glm-4.7-flash' }), 'deepseek-flash');
+  // 反过来也一样
+  assert.equal(aiModelName({}, { MODEL: 'deepseek-flash' }), 'glm-4.7-flash');
+  // 同家族的自定义模型名要保留
+  assert.equal(aiModelName({}, { MODEL: 'glm-4.5-air' }), 'glm-4.5-air');
+  assert.equal(aiModelName({ AI_PROVIDER: 'deepseek' }, { MODEL: 'deepseek-v4-pro' }), 'deepseek-v4-pro');
+  assert.equal(aiModelName({}, {}), 'glm-4.7-flash');
+});
+
+test('联网搜索只挂在 DeepSeek 名下', () => {
+  assert.equal(aiSearchSupported({}), false, '智谱免费模型不该触发付费搜索');
+  assert.equal(aiSearchSupported({ AI_PROVIDER: 'deepseek' }), true);
+});
+
+test('免费模型不记钱，付费型号按保守估价记', () => {
+  assert.equal(isFreeModel('glm-4.7-flash'), true);
+  assert.equal(isFreeModel('glm-4-flash'), true);
+  assert.equal(isFreeModel('glm-4.5-air'), true);
+  assert.equal(isFreeModel('glm-4.7'), false, '常规型号是付费的');
+  assert.equal(isFreeModel(''), false);
 });
