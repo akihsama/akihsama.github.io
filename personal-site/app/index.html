@@ -1663,7 +1663,9 @@
 
         renderAgentReply(reply, '本地食神', 'local', '降级模式');
         document.getElementById('agentBadge').textContent = '本地降级';
-        document.getElementById('agentHint').textContent = '后端暂不可用，当前使用本地推荐。配置好后会自动切换。';
+        document.getElementById('agentHint').textContent = (error && error.code === 'UPSTREAM_BUSY')
+          ? '食神通道排队中（免费额度并发限制），这次用本地推荐顶上，过一会儿会自动恢复。'
+          : '后端暂不可用，当前使用本地推荐。配置好后会自动切换。';
         conversation.push({ role: 'assistant', content: reply });
 
         if (food) addHistory(food);

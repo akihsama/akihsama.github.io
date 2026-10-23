@@ -246,12 +246,18 @@ async function handleChat(request, env, config, cors) {
   } catch (e) {
     const status = (e instanceof DeepSeekError || e instanceof ZhipuError) ? e.status : 502;
     await writeUsage(env, day, usage);
+    // 免费档并发约 1 路，高峰期上游会回 429（智谱 code 1305）。这不是本站故障，
+    // 给前端一个明确的「稍后再试」信号，让它降级本地食神而不是弹错误框。
+    const busy = status === 429 || /访问量过大|rate limit|too many/i.test(e.message || '');
     return json({
-      error: '食神暂时连不上：' + (e.message || '未知错误'),
-      code: 'UPSTREAM_ERROR',
+      error: busy
+        ? '食神这会儿忙不过来（免费通道排队中），先给你本地签，稍后再问一次'
+        : '食神暂时连不上：' + (e.message || '未知错误'),
+      code: busy ? 'UPSTREAM_BUSY' : 'UPSTREAM_ERROR',
       provider,
       status,
       degraded: true,
+      retryAfter: busy ? 8 : undefined,
     }, 502, cors);
   }
 
