@@ -5,7 +5,8 @@
  *   Authorization: Bearer <ZHIPU_API_KEY>
  *
  * 默认模型 glm-4.7-flash：输入输出全免费、不限量，官方定位长期产品。
- * 免费层的限制在并发（约 1 路），所以这里不做重试风暴，失败就老实上报，
+ * 免费层的限制在并发（约 1 路），连发请求会撞 429（code 1305）。
+ * 这里对 429/500/503 做 0/1.2s/2.6s 三段退避，约 4 秒内仍失败就老实上报，
  * 由前端降级本地食神——比悄悄拖 20 秒再超时体验好得多。
  *
  * 计费：免费模型成本记 0；若把 MODEL 换成付费型号，用下面的 RATE 兜底估算，
@@ -90,29 +91,45 @@ export async function zhipuChat({ apiKey, model, messages, maxTokens, temperatur
   body.thinking = { type: thinking === 'enabled' ? 'enabled' : 'disabled' };
   if (json) body.response_format = { type: 'json_object' };
 
-  const data = await post('/chat/completions', apiKey, body, timeoutMs);
+  // 免费档并发约 1 路，连续提问很容易撞上 429（code 1305）。
+  // 在服务端退避重试 2 次，比让用户看到「排队中」体验好得多；
+  // 总耗时仍受 timeoutMs 约束，不会把 Worker 拖到超时。
+  const delays = [0, 1200, 2600];
+  let lastErr = null;
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    if (delays[attempt]) await sleep(delays[attempt]);
+    try {
+      const data = await post('/chat/completions', apiKey, body, timeoutMs);
+      return extract(data, model, maxTokens, apiKey, body, timeoutMs);
+    } catch (e) {
+      lastErr = e;
+      const retryable = e instanceof ZhipuError && (e.status === 429 || e.status === 503 || e.status === 500);
+      if (!retryable) throw e;
+    }
+  }
+  throw lastErr;
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+/** 从一次成功的响应里取正文；正文为空但有 reasoning 时翻倍预算再要一次 */
+async function extract(data, fallbackModel, maxTokens, apiKey, body, timeoutMs) {
   const choice = (data.choices || [])[0] || {};
   const message = choice.message || {};
-  let content = String(message.content || '').trim();
+  const content = String(message.content || '').trim();
+  if (content) return finish(data, fallbackModel, content);
 
-  // 兜底：万一某些型号忽略 thinking 开关，把 reasoning 吃满导致 content 为空，
-  // 不要把空串当成「上游故障」，而是重试一次更短的请求（预算翻倍、仍关思考）。
-  if (!content) {
-    const reason = message.reasoning_content;
-    if (reason) {
-      const retry = await post('/chat/completions', apiKey, Object.assign({}, body, {
-        max_tokens: Math.max((maxTokens || 320) * 2, 512),
-      }), timeoutMs);
-      const c2 = (retry.choices || [])[0] || {};
-      content = String((c2.message && c2.message.content) || '').trim();
-      if (content) {
-        return finish(retry, model, content);
-      }
-    }
-    throw new ZhipuError('模型返回空内容', 502);
+  if (message.reasoning_content) {
+    const retry = await post('/chat/completions', apiKey, Object.assign({}, body, {
+      max_tokens: Math.max((maxTokens || 320) * 2, 512),
+    }), timeoutMs);
+    const c2 = (retry.choices || [])[0] || {};
+    const content2 = String((c2.message && c2.message.content) || '').trim();
+    if (content2) return finish(retry, fallbackModel, content2);
   }
-
-  return finish(data, model, content);
+  throw new ZhipuError('模型返回空内容', 502);
 }
 
 function finish(data, fallbackModel, content) {
