@@ -232,3 +232,44 @@ test('content 为空但有 reasoning 时自动重试一次，而不是直接报�
     globalThis.fetch = origFetch;
   }
 });
+
+test('429 会退避重试，最终成功时不报错', async () => {
+  let n = 0;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    n += 1;
+    if (n === 1) {
+      return new Response(JSON.stringify({ error: { code: '1305', message: '该模型当前访问量过大' } }), { status: 429 });
+    }
+    return new Response(JSON.stringify({
+      model: 'glm-4.7-flash',
+      choices: [{ message: { content: '【砂锅粥】\n热乎养胃' } }],
+      usage: {},
+    }), { status: 200 });
+  };
+  try {
+    const res = await zhipuChat({ apiKey: 'k', model: 'glm-4.7-flash', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(n, 2, '撞到 429 后应重试');
+    assert.equal(res.content, '【砂锅粥】\n热乎养胃');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('401 不重试，立刻抛出（避免拿错 Key 空转）', async () => {
+  let n = 0;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    n += 1;
+    return new Response(JSON.stringify({ error: { code: '1000', message: '令牌已过期或验证不正确' } }), { status: 401 });
+  };
+  try {
+    await assert.rejects(
+      () => zhipuChat({ apiKey: 'bad', model: 'glm-4.7-flash', messages: [{ role: 'user', content: 'hi' }] }),
+      /令牌已过期/
+    );
+    assert.equal(n, 1, '401 不能重试');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
